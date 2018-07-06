@@ -1,0 +1,1486 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using UvsChess;
+using System.Diagnostics;
+
+namespace WhiteHouseAI
+{
+    public class WhiteHouseAI : IChessAI
+    {
+        #region IChessAI Members that are implemented by the Student
+
+        /// <summary>
+        /// The name of your AI
+        /// </summary>
+        public string Name
+        {
+#if DEBUG
+            get { return "WhiteHouseAI (Debug)"; }
+#else
+            get { return "WhiteHouseAI"; }
+#endif
+        }
+
+        /// <summary>
+        /// Evaluates the chess board and decides which move to make. This is the main method of the AI.
+        /// The framework will call this method when it's your turn.
+        /// </summary>
+        /// <param name="board">Current chess board</param>
+        /// <param name="yourColor">Your color</param>
+        /// <returns> Returns the best chess move the player has for the given chess board</returns>
+        public ChessMove GetNextMove(ChessBoard board, ChessColor myColor)
+        {
+            // Save off our color as playerColor.
+            playerColor = myColor;
+
+            // If this is the first time being called, we create a root node for the game at
+            // the given puzzle location (the root node represents the opponents last move).
+            ChessColor oppColor = (myColor == ChessColor.White) ? ChessColor.Black : ChessColor.White;
+            if (root == null)
+            {
+                root = new Node(this, oppColor, board);
+            }
+
+            // Check to see if we should use opening book moves
+            if (playerColor == ChessColor.White)
+            {
+                if (whiteBook.ContainsKey(board.ToPartialFenBoard()))
+                {
+                    root = root.makeMove(this, whiteBook[board.ToPartialFenBoard()]);
+                    return root.move;
+                }
+            }
+            else if (playerColor == ChessColor.Black)
+            {
+                if (blackBook.ContainsKey(board.ToPartialFenBoard()))
+                {
+                    root = root.makeMove(this, blackBook[board.ToPartialFenBoard()]);
+                    return root.move;
+                }
+            }
+
+            // Compute our best move from current root, and advance the root to the next position.
+            root = root.bestMove(this);     // this call performs mini-max search, and returns the node representing the move we will take.  
+
+            return root.move;
+        }
+
+        /// <summary>
+        /// Validates a move. The framework uses this to validate the opponents move.
+        /// </summary>
+        /// <param name="boardBeforeMove">The board as it currently is _before_ the move.</param>
+        /// <param name="moveToCheck">This is the move that needs to be checked to see if it's valid.</param>
+        /// <param name="colorOfPlayerMoving">This is the color of the player who's making the move.</param>
+        /// <returns>Returns true if the move was valid</returns>
+        public bool IsValidMove(ChessBoard boardBeforeMove, ChessMove moveToCheck, ChessColor colorOfPlayerMoving)
+        {
+            // Save off our color as the playerColor.
+            playerColor = (colorOfPlayerMoving == ChessColor.White) ? ChessColor.Black : ChessColor.White;
+
+            // If the opponent moves first we must create the initial root of the game, with the root node representing
+            // our initial position (board state after opponent's move).
+            if (root == null)
+            {
+                root = new Node(this, playerColor, boardBeforeMove);
+            }
+
+            // We now use the root of the game to attempt to make the move the opponent requests.
+            // (this moves the root to the next position).
+            root = root.makeMove(this, moveToCheck);
+
+            // If new root is null, then the move was invalid.
+            if (root == null)
+                return false;
+
+            return true;
+        }
+
+        #endregion
+
+        //------------------------------------------------
+        public ChessColor playerColor;       // keep track of the player color that this AI is representing
+        Node root = null;                    // keep track of the root node of the current game tree
+        Random random = new Random();        // create random number generator for the game
+        //------------------------------------------------
+
+        #region Move Generation Code
+
+        //------------------------------------------------
+        /// <summary>
+        /// Structure used to store walking directions/positional offsets.
+        /// </summary>
+        struct Dir
+        {
+            public int dx;      // change in x
+            public int dy;      // change in y
+            public Dir(int x, int y) { dx = x; dy = y; }
+        }
+
+        // Create an array of directions/offsets for each piece (excluding pawn).
+        static Dir[] rookDirections = { new Dir(0, -1), new Dir(0, 1), new Dir(1, 0), new Dir(-1, 0) };
+        static Dir[] knightDirections = { new Dir(-2, -1), new Dir(-2, 1), new Dir(-1, -2), new Dir(-1, 2), new Dir(2, -1), new Dir(2, 1), new Dir(1, -2), new Dir(1, 2) };
+        static Dir[] bishopDirections = { new Dir(-1, -1), new Dir(1, -1), new Dir(1, 1), new Dir(-1, 1) };
+        static Dir[] queenDirections = { new Dir(-1, -1), new Dir(1, -1), new Dir(1, 1), new Dir(-1, 1), new Dir(0, -1), new Dir(0, 1), new Dir(1, 0), new Dir(-1, 0) };
+        static Dir[] kingDirections = { new Dir(-1, -1), new Dir(1, -1), new Dir(1, 1), new Dir(-1, 1), new Dir(0, -1), new Dir(0, 1), new Dir(1, 0), new Dir(-1, 0) };
+        //------------------------------------------------
+
+        /// <summary>
+        /// Generate a list of all valid moves.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="color"></param>
+        /// <returns></returns>
+        List<ChessMove> GenerateAllValidMoves(ChessBoard board, ChessColor color)
+        {
+            List<ChessMove> moves = GenerateAllMoves(board, color);
+            return moves;
+        }
+
+        #region Moves dealing with check and checkmate
+
+        /// <summary>
+        /// Check to see if the given move places the given color player in check.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="color"></param>
+        /// <returns></returns>
+        bool inCheck(ChessBoard board, ChessColor color, ChessMove move)
+        {
+            // Temporarily make move, remembering displaced piece.
+            bool inCheck = false;
+            ChessPiece savedPiece = board[move.To];
+            board[move.To] = board[move.From];
+            board[move.From] = ChessPiece.Empty;
+
+            // Determine where king of opposite color (given color) is located. 
+            // (change search direction based on player color, assuming that the king is generally on its own side)
+            ChessLocation kingLoc = new ChessLocation(0, 0);
+            bool kingFound = false;
+
+            // If searching for white king, start searching on white player end of board.
+            if (color == ChessColor.White)
+            {
+                for (int y = 7; !kingFound && y >= 0; y--)
+                {
+                    for (int x = 0; !kingFound && x <= 7; x++)
+                    {
+                        if (board[x, y] == ChessPiece.WhiteKing)
+                        {
+                            kingLoc = new ChessLocation(x, y);
+                            kingFound = true;
+                        }
+                    }
+                }
+            }
+            // If searching for black king, start searching on black player end of board.
+            else
+            {
+                for (int y = 0; !kingFound && y <= 7; y++)
+                {
+                    for (int x = 0; !kingFound && x <= 7; x++)
+                    {
+                        if (board[x, y] == ChessPiece.BlackKing)
+                        {
+                            kingLoc = new ChessLocation(x, y);
+                            kingFound = true;
+                        }
+                    }
+                }
+            }
+
+            // Check to see if king can be killed by opponent pawn.
+            if (color == ChessColor.White)
+            {
+                ChessPiece oppPawn = ChessPiece.BlackPawn;
+                int y = kingLoc.Y - 1;
+                if (y >= 0 && kingLoc.X + 1 <= 7 && board[kingLoc.X + 1, y] == oppPawn)
+                {
+                    inCheck = true;
+                }
+                else if (kingLoc.X - 1 >= 0 && y >= 0 && board[kingLoc.X - 1, y] == oppPawn)
+                {
+                    inCheck = true;
+                }
+            }
+            else  // color == black
+            {
+                ChessPiece oppPawn = ChessPiece.WhitePawn;
+                int y = kingLoc.Y + 1;
+                if (y <= 7 && kingLoc.X + 1 <= 7 && board[kingLoc.X + 1, y] == oppPawn)
+                {
+                    inCheck = true;
+                }
+                else if (kingLoc.X - 1 >= 0 && y <= 7 && board[kingLoc.X - 1, y] == oppPawn)
+                {
+                    inCheck = true;
+                }
+            }
+
+            // Check to see if king can be killed by opponent knight (if not already in check).
+            if (!inCheck)
+            {
+                ChessPiece oppKnight = (color == ChessColor.White) ? ChessPiece.BlackKnight : ChessPiece.WhiteKnight;
+                foreach (Dir dir in knightDirections)
+                {
+                    int x = kingLoc.X + dir.dx;
+                    int y = kingLoc.Y + dir.dy;
+                    if (x >= 0 && x <= 7 && y >= 0 && y <= 7 && board[x, y] == oppKnight)
+                    {
+                        inCheck = true;
+                        break;
+                    }
+                }
+            }
+
+            // Check to see if king can be killed by opponent king.
+            if (!inCheck)
+            {
+                ChessPiece oppKing = (color == ChessColor.White) ? ChessPiece.BlackKing : ChessPiece.WhiteKing;
+                foreach (Dir dir in kingDirections)
+                {
+                    int x = kingLoc.X + dir.dx;
+                    int y = kingLoc.Y + dir.dy;
+                    if (x >= 0 && x <= 7 && y >= 0 && y <= 7 && board[x, y] == oppKing)
+                    {
+                        inCheck = true;
+                        break;
+                    }
+                }
+            }
+
+            // Check to see if king can be killed by continuous move opponent piece (queen, rook, bishop).
+            if (!inCheck)
+            {
+                foreach (Dir d in queenDirections)
+                {
+                    int x = kingLoc.X + d.dx;
+                    int y = kingLoc.Y + d.dy;
+                    bool pieceHit = false;
+                    while (!pieceHit && x >= 0 && x < 8 && y >= 0 && y < 8)
+                    {
+                        ChessPiece piece = board[x, y];
+                        if (piece != ChessPiece.Empty)
+                        {
+                            pieceHit = true;
+                            ChessColor pieceColor = (piece < ChessPiece.Empty) ? ChessColor.Black : ChessColor.White;
+                            if (pieceColor != color) // piece is opponent
+                            {
+                                switch (piece)
+                                {
+                                    case ChessPiece.WhiteRook:
+                                    case ChessPiece.BlackRook:
+                                        inCheck = (d.dx == 0 || d.dy == 0);    // if rook, and path to king is not diagonal, the king is in check
+                                        break;
+                                    case ChessPiece.WhiteBishop:
+                                    case ChessPiece.BlackBishop:
+                                        inCheck = (d.dx != 0 && d.dy != 0);    // if bishop, and path to king is diagonal, the king is in check
+                                        break;
+                                    case ChessPiece.WhiteQueen:
+                                    case ChessPiece.BlackQueen:
+                                        inCheck = true;                        // if queen, and any path to king, the king is in check
+                                        break;
+                                    default:
+                                        break;
+                                }
+                            }
+                        }
+
+                        // Move to next tile along path in current direction.
+                        x += d.dx;
+                        y += d.dy;
+                    }
+
+                    if (inCheck)
+                        break;      // if a piece found that puts king in check, stop looping through directions/looking for checks
+                }
+            }
+
+            // Undo temporary move.
+            board[move.From] = board[move.To];
+            board[move.To] = savedPiece;
+            return inCheck;
+        }
+
+        #endregion
+
+        #region Chess Moves that we have implemented
+
+        /// <summary>
+        /// Generate all possible, valid moves a player may make, given the current board and player color.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="myColor"></param>
+        /// <returns></returns>
+        List<ChessMove> GenerateAllMoves(ChessBoard board, ChessColor myColor)
+        {
+            List<ChessMove> moves = new List<ChessMove>();
+
+            for (int y = 0; y < ChessBoard.NumberOfRows; y++)
+            {
+                for (int x = 0; x < ChessBoard.NumberOfColumns; x++)
+                {
+                    if (board[x, y] == ChessPiece.Empty)
+                        continue;
+
+                    ChessColor pieceColor = board[x, y] < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor == myColor)
+                    {
+                        GeneratePieceMoves(board, new ChessLocation(x, y), myColor, moves);
+                    }
+                }
+            }
+            return moves;
+        }
+
+        /// <summary>
+        /// Generate all possible, valid moves for the chess piece at the given board location.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GeneratePieceMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            switch (board[location.X, location.Y])
+            {
+                case ChessPiece.BlackPawn:
+                case ChessPiece.WhitePawn:
+                    GeneratePawnMoves(board, location, color, moves);
+                    break;
+                case ChessPiece.BlackRook:
+                case ChessPiece.WhiteRook:
+                    GenerateRookMoves(board, location, color, moves);
+                    break;
+                case ChessPiece.BlackKnight:
+                case ChessPiece.WhiteKnight:
+                    GenerateKnightMoves(board, location, color, moves);
+                    break;
+                case ChessPiece.BlackBishop:
+                case ChessPiece.WhiteBishop:
+                    GenerateBishopMoves(board, location, color, moves);
+                    break;
+                case ChessPiece.BlackQueen:
+                case ChessPiece.WhiteQueen:
+                    GenerateQueenMoves(board, location, color, moves);
+                    break;
+                case ChessPiece.BlackKing:
+                case ChessPiece.WhiteKing:
+                    GenerateKingMoves(board, location, color, moves);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Generate all moves for a Pawn.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GeneratePawnMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            int dy = color == ChessColor.White ? -1 : 1;        // y direction pawn can move based on color
+            int startRow = color == ChessColor.White ? 6 : 1;   // pawn start row based on color
+            int endRow = (color == ChessColor.White) ? 0 : 7;   // furthest row pawn can reach without going off board
+
+            // If pawn hasn't reached its end row, find its possible moves.
+            if (location.Y != endRow)
+            {
+                // If space in front of pawn is empty, it can move there (add move).
+                if (board[location.X, location.Y + dy] == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(location.X, location.Y + dy));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+
+                    // If on starting row and there are two free spaces in front of pawn, it can move forward two (add move).
+                    if (location.Y == startRow && board[location.X, location.Y + (2 * dy)] == ChessPiece.Empty)
+                    {
+                        move = new ChessMove(location, new ChessLocation(location.X, location.Y + (2 * dy)));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+                // Check if there is a kill to the left.
+                if (location.X >= 1)
+                {
+                    ChessPiece piece = board[location.X - 1, location.Y + dy];
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (piece != ChessPiece.Empty && pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(location.X - 1, location.Y + dy));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+                // Check if there is a kill to the right.
+                if (location.X < (ChessBoard.NumberOfColumns - 1))
+                {
+                    ChessPiece piece = board[location.X + 1, location.Y + dy];
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (piece != ChessPiece.Empty && pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(location.X + 1, location.Y + dy));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generate all moves for a rook.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GenerateRookMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            // Check for move in upward direction.
+            for (int y = location.Y - 1; y >= 0; y--)
+            {
+                ChessPiece piece = board[location.X, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+
+                    break;  // stop looking (encountered one of our own pieces)                
+                }
+            }
+
+            // Check for moves in downward direction.
+            for (int y = location.Y + 1; y <= 7; y++)
+            {
+                ChessPiece piece = board[location.X, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                    break;  // stop looking (encountered one of our own pieces)
+                }
+            }
+
+            // Check for moves in left direction.
+            for (int x = location.X - 1; x >= 0; x--)
+            {
+                ChessPiece piece = board[x, location.Y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                    break;  // stop looking (encountered one of our own pieces)
+                }
+            }
+
+            // Check for moves in right direction.
+            for (int x = location.X + 1; x <= 7; x++)
+            {
+                ChessPiece piece = board[x, location.Y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                    break;  // stop looking (encountered one of our own pieces)
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generate all moves for a knight. 
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GenerateKnightMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            List<ChessLocation> offsets = new List<ChessLocation>();
+
+            // Left then Up direction
+            if ((location.X - 2 >= 0) && (location.X - 2 < ChessBoard.NumberOfColumns) &&
+                         (location.Y - 1 >= 0) && (location.Y - 1 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X - 2, location.Y - 1));
+            }
+
+            // Left then Down direction
+            if ((location.X - 2 >= 0) && (location.X - 2 < ChessBoard.NumberOfColumns) &&
+                         (location.Y + 1 >= 0) && (location.Y + 1 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X - 2, location.Y + 1));
+            }
+
+            // Right then Up direction
+            if ((location.X + 2 >= 0) && (location.X + 2 < ChessBoard.NumberOfColumns) &&
+                         (location.Y - 1 >= 0) && (location.Y - 1 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X + 2, location.Y - 1));
+            }
+
+            // Right then Down direction
+            if ((location.X + 2 >= 0) && (location.X + 2 < ChessBoard.NumberOfColumns) &&
+                         (location.Y + 1 >= 0) && (location.Y + 1 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X + 2, location.Y + 1));
+            }
+
+            // Up then Left direction
+            if ((location.X - 1 >= 0) && (location.X - 1 < ChessBoard.NumberOfColumns) &&
+                         (location.Y - 2 >= 0) && (location.Y - 2 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X - 1, location.Y - 2));
+            }
+
+            // Up then Right direction
+            if ((location.X + 1 >= 0) && (location.X + 1 < ChessBoard.NumberOfColumns) &&
+                         (location.Y - 2 >= 0) && (location.Y - 2 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X + 1, location.Y - 2));
+            }
+
+            // Down then Left direction
+            if ((location.X - 1 >= 0) && (location.X - 1 < ChessBoard.NumberOfColumns) &&
+                         (location.Y + 2 >= 0) && (location.Y + 2 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X - 1, location.Y + 2));
+            }
+
+            // Down then Right direction
+            if ((location.X + 1 >= 0) && (location.X + 1 < ChessBoard.NumberOfColumns) &&
+                         (location.Y + 2 >= 0) && (location.Y + 2 < ChessBoard.NumberOfRows))
+            {
+                offsets.Add(new ChessLocation(location.X + 1, location.Y + 2));
+            }
+
+            // Loop through valid locations
+            foreach (ChessLocation toLocation in offsets)
+            {
+                ChessPiece piece = board[toLocation];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, toLocation);
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove moveToTake = new ChessMove(location, toLocation);
+
+                        if (piece == ChessPiece.BlackKing || piece == ChessPiece.WhiteKing)
+                        {
+                            moveToTake.Flag = ChessFlag.Checkmate;
+                        }
+
+                        if (!inCheck(board, color, moveToTake))
+                            moves.Add(moveToTake);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generate all moves for a bishop.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GenerateBishopMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            // Set the x location so we can increment that as well
+            int x = location.X - 1;
+
+            // Check for move in upward left direction.
+            for (int y = location.Y - 1; y >= 0 && x >= 0; y--, x--)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+
+                    // Piece was found, stopping loop because bishop can't go through pieces
+                    break;
+                }
+            }
+
+            // Check for upward right direction.
+            x = location.X + 1;
+            for (int y = location.Y - 1; y >= 0 && x <= 7; y--, x++)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+
+                    // Piece was found, stopping loop because bishop can't go through pieces
+                    break;
+                }
+            }
+
+            // Check for downward left direction.
+            x = location.X - 1;
+            for (int y = location.Y + 1; y <= 7 && x >= 0; y++, x--)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+
+                    // Piece was found, stopping loop because bishop can't go through pieces
+                    break;
+                }
+            }
+
+            // Check for downward right direction.
+            x = location.X + 1;
+            for (int y = location.Y + 1; y <= 7 && x <= 7; y++, x++)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        // Special spot of taking an opponents piece, noting here just in case we need to assign value to this later
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+
+                    // Piece was found, stopping loop because bishop can't go through pieces
+                    break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generate all moves for a queen.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GenerateQueenMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            // Queen has same move set as Bishop and Rook put together
+            GenerateBishopMoves(board, location, color, moves);
+            GenerateRookMoves(board, location, color, moves);
+        }
+
+        /// <summary>
+        /// Generate all moves for a king.
+        /// </summary>
+        /// <param name="board"></param>
+        /// <param name="location"></param>
+        /// <param name="color"></param>
+        /// <param name="moves"></param>
+        void GenerateKingMoves(ChessBoard board, ChessLocation location, ChessColor color, List<ChessMove> moves)
+        {
+            // Check for move in upward direction.
+            int y = location.Y - 1;
+            if (y >= 0)
+            {
+                ChessPiece piece = board[location.X, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in upward-left direction.
+            int x = location.X - 1;
+            y = location.Y - 1;
+            if (x >= 0 && y >= 0)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in upward-right direction.
+            x = location.X + 1;
+            y = location.Y - 1;
+            if (x <= 7 && y >= 0)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in downward direction.
+            y = location.Y + 1;
+            if (y <= 7)
+            {
+                ChessPiece piece = board[location.X, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(location.X, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in downward-left direction.
+            x = location.X - 1;
+            y = location.Y + 1;
+            if (x >= 0 && y <= 7)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in downward-right direction.
+            x = location.X + 1;
+            y = location.Y + 1;
+            if (x <= 7 && y <= 7)
+            {
+                ChessPiece piece = board[x, y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in left direction.
+            x = location.X - 1;
+            if (x >= 0)
+            {
+                ChessPiece piece = board[x, location.Y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+
+            // Check for move in right direction.
+            x = location.X + 1;
+            if (x <= 7)
+            {
+                ChessPiece piece = board[x, location.Y];
+                if (piece == ChessPiece.Empty)
+                {
+                    ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                    if (!inCheck(board, color, move))
+                        moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                }
+                else
+                {
+                    ChessColor pieceColor = piece < ChessPiece.Empty ? ChessColor.Black : ChessColor.White;
+                    if (pieceColor != color)
+                    {
+                        ChessMove move = new ChessMove(location, new ChessLocation(x, location.Y));
+                        if (!inCheck(board, color, move))
+                            moves.Add(move);    // only add move to moves if it doesn't put the player in check
+                    }
+                }
+            }
+        }
+
+        #endregion  // end of chess piece moves
+
+        #endregion  // end of move generation code
+
+        #region Opening Books
+        bool inOpeningBook = true;
+
+        // Queen's Gambit opening book boards
+        static string startingBoard = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+        static string qGSecond = "rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR";
+        static string qGThird = "rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR";
+        static string qGFourth = "rnbqkbnr/p1p1pppp/8/1p6/2pP4/4P3/PP3PPP/RNBQKBNR";
+        static string qGFifth = "rnbqkbnr/p3pppp/2p5/1p6/P1pP4/4P3/1P3PPP/RNBQKBNR";
+        static string qGSixth = "rnbqkbnr/p3pppp/8/1p6/2pP4/4P3/1P3PPP/RNBQKBNR";
+        static string qGSeventh = "r1bqkbnr/p3pppp/2n5/1p6/2pP4/4PQ2/1P3PPP/RNB1KBNR";
+        static string qGEighth = "r2qkbnr/p2bpppp/2Q5/1p6/2pP4/4P3/1P3PPP/RNB1KBNR";
+
+        Dictionary <string, ChessMove> whiteBook = new Dictionary<string, ChessMove>
+        {
+            {startingBoard, new ChessMove(new ChessLocation(3,6), new ChessLocation(3,4), ChessFlag.NoFlag)},    // Starting move Queen's pawn up 2 spaces
+            {qGSecond, new ChessMove(new ChessLocation(2,6), new ChessLocation(2,4), ChessFlag.NoFlag)},     // Pawn from 2,6 to 2,4
+            {qGThird, new ChessMove(new ChessLocation(4,6), new ChessLocation(4,5), ChessFlag.NoFlag)},     // Pawn from 4,6 to 4,5
+            {qGFourth, new ChessMove(new ChessLocation(0,6), new ChessLocation(0,4), ChessFlag.NoFlag)},     // Pawn from 0,6 to 0,4
+            {qGFifth, new ChessMove(new ChessLocation(0,4), new ChessLocation(1,3), ChessFlag.NoFlag)},     // Pawn from 0,4 to 1,3  Captures Black Pawn
+            {qGSixth, new ChessMove(new ChessLocation(3,7), new ChessLocation(5,5), ChessFlag.NoFlag)},     // Queen from 3,7 to 5,5  Queen in position to take Rook
+            {qGSeventh, new ChessMove(new ChessLocation(5,5), new ChessLocation(2,2), ChessFlag.Check)},     // Queen from 5,5 to 2,2  Queen takes knight and puts king in check
+            {qGEighth, new ChessMove(new ChessLocation(2,2), new ChessLocation(0,2), ChessFlag.NoFlag)},     // Queen from 2,2 to 0,2  Retreat Queen to safety
+        };
+
+        // Fool's Mate opening book boards
+        static string fMStarting = "rnbqkbnr/pppppppp/8/8/8/5P2/PPPPP1PP/RNBQKBNR";
+        static string fMSecond = "rnbqkbnr/pppp1ppp/4p3/8/6P1/5P2/PPPPP2P/RNBQKBNR";
+
+        // Sicilian Defense opening book boards
+        static string sDStarting = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR";
+
+        Dictionary<string, ChessMove> blackBook = new Dictionary<string, ChessMove>
+        {
+            {fMStarting, new ChessMove(new ChessLocation(4,1), new ChessLocation(4,2), ChessFlag.NoFlag)},    // Pawn from 4,1 to 4,2
+            {fMSecond, new ChessMove(new ChessLocation(3,0), new ChessLocation(7,4), ChessFlag.Checkmate)},    // Queen from 3,0 to 7,4  Checkmate
+            {sDStarting, new ChessMove(new ChessLocation(2,1), new ChessLocation(2,3), ChessFlag.NoFlag)},    // Pawn from 4,1 to 4,2
+        };
+
+        #endregion
+
+        #region Mini-Max Algorithm Code
+
+        /// <summary>
+        /// Represents a new board state in the game/our search tree.
+        /// </summary>
+        class Node
+        {
+            //const int MAX_DEPTH = 2;      // go one level deep for greedy search  (returns greatest child heuristic value without looking at opponent moves)
+            //const int MAX_DEPTH = 3;        // opponents moves
+            const int MAX_DEPTH = 4;      // our moves after opponents
+            //const int MAX_DEPTH = 5;      // two tiered?
+            const int MAX = 1000000;
+            const int MIN = -1000000;
+            const int MAX_DEPTH_CHILDREN = 10;    // max number of children that will be searched to max depth
+
+            //------------------------     P     R       H      B      Q    K  E    P    R      H     B     Q    K
+            static int[] pieceValue = { -1000, -5000, -3000, -3000, -8000, 0, 0, 1000, 5000, 3000, 3000, 8000, 0 };
+            const int CHECKMATE_VALUE = 100000;
+            static int nodesProcessed = 0;
+
+            public ChessBoard board;
+            public ChessMove move;               // the move that got us to this board
+            public int hValue;                   // current board's heuristic value
+            public ChessColor color;             // color that made the move to generate this node
+            public Node[] children;
+            private List<ChessMove> validMoves;
+
+            //-------------------------------------------------------
+            public Node(WhiteHouseAI ai, ChessColor color, ChessBoard parentBoard, ChessMove move=null)
+            {
+                this.color = color;
+                this.move = move;
+
+                // Create the node's board, by starting with the parent's board and making the given move.
+                board = parentBoard.Clone();
+
+                // If no move is provided, then this node is the first node of the game (starting board state).
+                if (move != null)
+                {
+                    board[move.To] = board[move.From];
+                    board[move.From] = ChessPiece.Empty;
+
+                    // Check to see if a pawn has reached the opposite end of the board. If so, change it to a queen.
+                    int endRow = (color == ChessColor.White) ? 0 : 7;
+                    if (move.To.Y == endRow)
+                    {
+                        ChessPiece piece = board[move.To];
+                        if (piece == ChessPiece.WhitePawn)
+                            board[move.To] = ChessPiece.WhiteQueen;
+                        else if (piece == ChessPiece.BlackPawn)
+                            board[move.To] = ChessPiece.BlackQueen;
+                    }
+                }
+                // Get a list of valid moves for this node (from this board state).
+                ChessColor oppColor = (color == ChessColor.White) ? ChessColor.Black : ChessColor.White;
+                validMoves = ai.GenerateAllValidMoves(board, oppColor);     // moves made from this state will be made by oppponent
+
+                // Check if the valid moves cause check and set flag if they do.
+                foreach (ChessMove nextMove in validMoves)
+                {
+                    if (ai.inCheck(board, color, nextMove))
+                        nextMove.Flag = ChessFlag.Check;
+                }
+
+                // Create an array to hold node's children (next board states), based on number of valid moves.
+                children = new Node[validMoves.Count];  // will automatically initialize children to null (haven't been created yet)
+
+                // Determine the node's heuristic value (based on board).
+                evaluateBoard(ai.playerColor);
+            }
+
+            #region Mobility Values
+            //-------------------------------------------------------
+            // Chess mobility values
+            private static int[,] WhitePawnTable =
+            {
+                { 0,  0,  0,  0,  0,  0,  0,  0 },
+                { 50, 50, 50, 50, 50, 50, 50, 50 },
+                { 10, 10, 20, 30, 30, 20, 10, 10 },
+                { 5,  5, 10, 27, 27, 10,  5,  5 },
+                { 0,  0,  0, 25, 25,  0,  0,  0 },
+                { 5, -5,-10,  0,  0,-10, -5,  5 },
+                { 5, 10, 10,-25,-25, 10, 10,  5 },
+                { 0,  0,  0,  0,  0,  0,  0,  0 }
+            };
+
+            private static int[,] BlackPawnTable =
+            {
+                { 0,  0,  0,  0,  0,  0,  0,  0 },
+                { 5, 10, 10,-25,-25, 10, 10,  5 },
+                { 5, -5,-10,  0,  0,-10, -5,  5 },
+                { 0,  0,  0, 25, 25,  0,  0,  0 },
+                { 5,  5, 10, 27, 27, 10,  5,  5 },
+                { 10, 10, 20, 30, 30, 20, 10, 10 },
+                { 50, 50, 50, 50, 50, 50, 50, 50 },
+                { 0,  0,  0,  0,  0,  0,  0,  0 }
+            };
+
+            private static int[,] WhiteBishopTable =
+            {
+                { -20,-10,-10,-10,-10,-10,-10,-20 },
+                { -10,  0,  0,  0,  0,  0,  0,-10 },
+                { -10,  0,  5, 10, 10,  5,  0,-10 },
+                {-10,  5,  5, 10, 10,  5,  5,-10 },
+                {-10,  0, 10, 10, 10, 10,  0,-10 },
+                {-10, 10, 10, 10, 10, 10, 10,-10 },
+                {-10,  5,  0,  0,  0,  0,  5,-10 },
+                {-20,-10,-40,-10,-10,-40,-10,-20 }
+            };
+
+            private static int[,] BlackBishopTable =
+            {
+                {-20,-10,-40,-10,-10,-40,-10,-20 },
+                {-10,  5,  0,  0,  0,  0,  5,-10 },
+                {-10, 10, 10, 10, 10, 10, 10,-10 },
+                {-10,  0, 10, 10, 10, 10,  0,-10 },
+                {-10,  5,  5, 10, 10,  5,  5,-10 },
+                { -10,  0,  5, 10, 10,  5,  0,-10 },
+                { -10,  0,  0,  0,  0,  0,  0,-10 },
+                { -20,-10,-10,-10,-10,-10,-10,-20 }
+
+            };
+
+            private static int[,] WhiteKnightTable =
+            {
+                { -50,-40,-30,-30,-30,-30,-40,-50 },
+                { -40,-20,  0,  0,  0,  0,-20,-40 },
+                { -30,  0, 10, 15, 15, 10,  0,-30 },
+                { -30,  5, 15, 20, 20, 15,  5,-30 },
+                { -30,  0, 15, 20, 20, 15,  0,-30 },
+                { -30,  5, 10, 15, 15, 10,  5,-30 },
+                { -40,-20,  0,  5,  5,  0,-20,-40 },
+                { -50,-40,-20,-30,-30,-20,-40,-50 },
+            };
+
+            private static int[,] BlackKnightTable =
+            {
+                { -50,-40,-20,-30,-30,-20,-40,-50 },
+                { -40,-20,  0,  5,  5,  0,-20,-40 },
+                { -30,  5, 10, 15, 15, 10,  5,-30 },
+                { -30,  0, 15, 20, 20, 15,  0,-30 },
+                { -30,  5, 15, 20, 20, 15,  5,-30 },
+                { -30,  0, 10, 15, 15, 10,  0,-30 },
+                { -40,-20,  0,  0,  0,  0,-20,-40 },
+                { -50,-40,-30,-30,-30,-30,-40,-50 }
+            };
+
+            private static int[,] WhiteKingTable =
+            {
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -20, -30, -30, -40, -40, -30, -30, -20 },
+                { -10, -20, -20, -20, -20, -20, -20, -10 },
+                { 20,  20,   0,   0,   0,   0,  20,  20 },
+                { 20,  30,  10,   0,   0,  10,  30,  20 }
+            };
+
+            private static int[,] BlackKingTable =
+            {
+                { 20,  30,  10,   0,   0,  10,  30,  20 },
+                { 20,  20,   0,   0,   0,   0,  20,  20 },
+                { -10, -20, -20, -20, -20, -20, -20, -10 },
+                { -20, -30, -30, -40, -40, -30, -30, -20 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 },
+                { -30, -40, -40, -50, -50, -40, -40, -30 }
+            };
+            #endregion
+
+            //-------------------------------------------------------
+            // Evaluates board to determine its heuristic value.
+            void evaluateBoard(ChessColor myColor)
+            {
+
+                ChessPiece myKing = (myColor == ChessColor.White) ? ChessPiece.WhiteKing : ChessPiece.BlackKing;
+
+                // Add up the value of all remaining pieces on the board (white pieces positive, black negative).
+                hValue = 0;
+                for (int y = 0; y < ChessBoard.NumberOfRows; y++)
+                    for (int x = 0; x < ChessBoard.NumberOfColumns; x++)
+                    {
+                        switch(board[x,y])
+                        {
+                            case ChessPiece.WhitePawn:
+                                hValue += pieceValue[(int)board[x, y]] + WhitePawnTable[x, y];
+                                break;
+                            case ChessPiece.BlackPawn:
+                                hValue += pieceValue[(int)board[x, y]] + BlackPawnTable[x, y];
+                                break;
+                            case ChessPiece.WhiteBishop:
+                                hValue += pieceValue[(int)board[x, y]] + WhiteBishopTable[x, y];
+                                break;
+                            case ChessPiece.BlackBishop:
+                                hValue += pieceValue[(int)board[x, y]] + BlackBishopTable[x, y];
+                                break;
+                            case ChessPiece.WhiteRook:
+                                hValue += pieceValue[(int)board[x, y]];
+                                break;
+                            case ChessPiece.BlackRook:
+                                hValue += pieceValue[(int)board[x, y]];
+                                break;
+                            case ChessPiece.WhiteKnight:
+                                hValue += pieceValue[(int)board[x, y]] + WhiteKnightTable[x, y];
+                                break;
+                            case ChessPiece.BlackKnight:
+                                hValue += pieceValue[(int)board[x, y]] + BlackKnightTable[x, y];
+                                break;
+                            case ChessPiece.WhiteQueen:
+                                hValue += pieceValue[(int)board[x, y]];
+                                break;
+                            case ChessPiece.BlackQueen:
+                                hValue += pieceValue[(int)board[x, y]];
+                                break;
+                            case ChessPiece.WhiteKing:
+                                hValue += pieceValue[(int)board[x, y]] + WhiteKingTable[x, y];
+                                break;
+                            case ChessPiece.BlackKing:
+                                hValue += pieceValue[(int)board[x, y]] + BlackKingTable[x, y];
+                                break;
+                        }
+                    }
+                        
+
+                // Negate score if the main player is black.
+                if (myColor == ChessColor.Black)
+                    hValue = -hValue;
+
+                // If there are no valid moves, then we have checkmate.  If so
+                // flag the move that got us here as a checkmate move.
+                if (validMoves.Count == 0)
+                {
+                    // If Check flag is NOT set, and validMoves.Count is 0
+                    // then this move puts them in stalemate NOT checkmate
+                    if (move.Flag == ChessFlag.Check)
+                    {
+                        move.Flag = ChessFlag.Checkmate;
+                        if (color == myColor)
+                            hValue += CHECKMATE_VALUE;
+                        else
+                            hValue -= CHECKMATE_VALUE;
+                    }   
+                }
+            }
+
+            //-------------------------------------------------------
+            // Get the requested child (by index).
+            Node getChild(WhiteHouseAI ai, int i)
+            {
+                // If the child hasn't already been created, create and return it.
+                if (children[i] == null)
+                {
+                    ChessColor oppColor = (color == ChessColor.White) ? ChessColor.Black : ChessColor.White;
+                    children[i] = new Node(ai, oppColor, board, validMoves[i]);
+                }
+                return children[i];
+            }
+
+            //-------------------------------------------------------
+            /// <summary>
+            /// Get the best move for our player for this board position (which child node to take).
+            ///     Entry point for min-max search (same as maxValue function, but keeps track of 
+            ///     which child has the max value, so we know which move to make/child to move to). 
+            /// </summary>
+            /// <param name="ai"></param>
+            /// <returns></returns>
+            public Node bestMove(WhiteHouseAI ai)
+            {
+                nodesProcessed = 1;
+                Stopwatch stopwatch = new Stopwatch();
+                stopwatch.Start();
+
+                // Get the minimum value for each child, and find the largest of those values.
+                // As we do this, we keep a list of all children/moves that have the same best/largest value.
+                List<Node> bestMoves = new List<Node>();
+                int maxValue = MIN;
+                int A = MIN;
+                int B = MAX;
+                int depth = 1;
+                for (int i = 0; i < validMoves.Count; i++)
+                {
+                    Node child = getChild(ai, i);
+                    int val = child.minValue(ai, depth + 1, A, B);
+                    if (bestMoves.Count == 0 || val == maxValue)
+                    {
+                        bestMoves.Add(child);
+                        maxValue = val;
+                    }
+                    else if (val > maxValue)
+                    {
+                        bestMoves.Clear();
+                        bestMoves.Add(child);
+                        maxValue = val;
+                    }
+                    A = Math.Max(maxValue, A);
+                }
+
+                ai.Log("nodes processed = " + nodesProcessed.ToString());
+
+                // If in stalemate, return a move with the stalemate flag
+                if (validMoves.Count == 0 && move.Flag != ChessFlag.Check)
+                {
+                    ChessMove stalemateMove = new ChessMove(new ChessLocation(0, 0), new ChessLocation(0, 1));
+                    stalemateMove.Flag = ChessFlag.Stalemate;
+                    return new Node(ai, color, board, stalemateMove);
+                }
+
+                // If there are multiple best moves (equally good), return a random move from the best list.
+                // If there is only one best move in list, it will be returned.
+                int index = ai.random.Next(bestMoves.Count);
+
+                stopwatch.Stop();
+                ai.Log("Time in bestMove: " + stopwatch.Elapsed);
+                ai.Log("");
+
+                return bestMoves[index];
+            }
+
+            //--------------------------------------------
+            // Attempt to make the given move for the opponent by finding the child node that matches
+            // the move (called by opponent IsValidMove -> returns node that will become the new root).
+            public Node makeMove(WhiteHouseAI ai, ChessMove move)
+            {
+                for (int i = 0; i < validMoves.Count; i++)
+                {
+                    Node child = getChild(ai, i);
+                    if (child.move.From.X == move.From.X && child.move.From.Y == move.From.Y &&
+                        child.move.To.X == move.To.X && child.move.To.Y == move.To.Y)
+                    {
+                        if (child.move.Flag == move.Flag)
+                        {
+                            return child;
+                        }
+                        else if (move.Flag == ChessFlag.Stalemate)
+                        {
+                            // If we had no valid moves and previous move flag was NOT check
+                            if (validMoves.Count == 0 && move.Flag != ChessFlag.Check)
+                            {
+                                return child;
+                            }
+                            else
+                            {
+                                ai.Log("Stalemate flag was incorrectly used.");
+                                return null;
+                            }
+                        }
+                        else
+                        {
+                            ai.Log("Flags did not match. " + move.Flag + " should have been " + child.move.Flag);
+                            return child;
+                        }
+                    }
+                }
+                return null;
+            }
+
+            //-------------------------------------------------------
+            // Get maximum value of node.
+            int maxValue(WhiteHouseAI ai, int depth, int A, int B)
+            {
+                nodesProcessed++;
+
+                // If max depth has been reached or there are no children (no possible moves), return node's heuristic value.
+                if (depth >= MAX_DEPTH || validMoves.Count == 0) 
+                    return hValue;
+
+                // Get the minimum value for each child, and return the largest of those values.
+                int maxValue = MIN;
+                int depthChange = 1;
+                int mod = Math.Max(validMoves.Count / MAX_DEPTH_CHILDREN, 1);
+                for (int i = 0; i < validMoves.Count; i++)
+                {
+                    // Prune search tree by limiting how many children are searched at max depth.
+                    if (i % mod == 0)
+                        depthChange = 1;    // will continue to increment depth by one until it reaches max depth (4)
+                    else
+                        depthChange = 3;    // will increment by three, causing search to stop at earlier depth (3)
+
+                    maxValue = Math.Max(getChild(ai, i).minValue(ai, depth + depthChange, A, B), maxValue);
+                    
+                    //If best max so far is greater than best min so far, then don't look at remaining children.
+                    if (maxValue > B)
+                        return maxValue;
+                    
+                    A = Math.Max(maxValue, A);
+                }
+                return maxValue;
+            }
+
+            //-------------------------------------------------------
+            // Get minimum value of node.
+            int minValue(WhiteHouseAI ai, int depth, int A, int B)
+            {
+                nodesProcessed++;
+
+                // If max depth has been reached or there are no children (no possible moves), return node's heuristic value.
+                if (depth >= MAX_DEPTH || validMoves.Count == 0)
+                    return hValue;
+
+                // Get the maximum value for each child, and return the smallest of those values.
+                int minValue = MAX;
+                int depthChange = 1;
+                int mod = Math.Max(validMoves.Count / MAX_DEPTH_CHILDREN, 1);
+                for (int i = 0; i < validMoves.Count; i++)
+                {
+                    // Prune search tree by limiting how many children are searched at max depth.
+                    if (i % mod == 0)
+                        depthChange = 1;
+                    else
+                        depthChange = 3;
+
+                    minValue = Math.Min(getChild(ai, i).maxValue(ai, depth + depthChange, A, B), minValue);
+
+                    // If best max so far is greater than best min so far, then don't look at remaining children.
+                    if (minValue < A)
+                        return minValue;
+
+                    B = Math.Min(minValue, B);
+                }
+                return minValue;
+            }
+        }
+
+        #endregion
+
+        #region IChessAI Members that should be implemented as automatic properties and should NEVER be touched by students.
+        /// <summary>
+        /// This will return false when the framework starts running your AI. When the AI's time has run out,
+        /// then this method will return true. Once this method returns true, your AI should return a 
+        /// move immediately.
+        /// 
+        /// You should NEVER EVER set this property!
+        /// This property should be defined as an Automatic Property.
+        /// This property SHOULD NOT CONTAIN ANY CODE!!!
+        /// </summary>
+        public AIIsMyTurnOverCallback IsMyTurnOver { get; set; }
+
+        /// <summary>
+        /// Call this method to print out debug information. The framework subscribes to this event
+        /// and will provide a log window for your debug messages.
+        /// 
+        /// You should NEVER EVER set this property!
+        /// This property should be defined as an Automatic Property.
+        /// This property SHOULD NOT CONTAIN ANY CODE!!!
+        /// </summary>
+        /// <param name="message"></param>
+        public AILoggerCallback Log { get; set; }
+
+        /// <summary>
+        /// Call this method to catch profiling information. The framework subscribes to this event
+        /// and will print out the profiling stats in your log window.
+        /// 
+        /// You should NEVER EVER set this property!
+        /// This property should be defined as an Automatic Property.
+        /// This property SHOULD NOT CONTAIN ANY CODE!!!
+        /// </summary>
+        /// <param name="key"></param>
+        public AIProfiler Profiler { get; set; }
+
+        /// <summary>
+        /// Call this method to tell the framework what decision print out debug information. The framework subscribes to this event
+        /// and will provide a debug window for your decision tree.
+        /// 
+        /// You should NEVER EVER set this property!
+        /// This property should be defined as an Automatic Property.
+        /// This property SHOULD NOT CONTAIN ANY CODE!!!
+        /// </summary>
+        /// <param name="message"></param>
+        public AISetDecisionTreeCallback SetDecisionTree { get; set; }
+        #endregion
+    }
+}
