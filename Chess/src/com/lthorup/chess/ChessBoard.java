@@ -15,6 +15,7 @@ public class ChessBoard {
 	private ChessLocation whiteKing, blackKing;
 	private ArrayList<ChessMove> validMoves;
 	private int value;
+	private ChessPiece movedPiece;
 	
 	//---------------------------------------------------
 	// valid move directions/offsets for piece types
@@ -105,37 +106,34 @@ public class ChessBoard {
         return children[i];
     }
 	//---------------------------------------------------
-	// test a move for validity
-	boolean validMove(ChessMove move) {
-		ArrayList<ChessMove> moves = new ArrayList<ChessMove>();
-		validMovesForPiece(move.from, moves);
-		for (ChessMove m : moves)
-			if (move.equals(m))
-				return true;
-		return false;
-	}
-	//---------------------------------------------------
 	// make move and return displaced piece
 	public ChessPiece makeMove(ChessMove move) {
+		movedPiece = get(move.from);
 		ChessPiece piece = get(move.to);
 		set(move.to, get(move.from));
 		set(move.from, ChessPiece.Empty);
 		ChessPiece p = get(move.to);
-		if (p.equals(ChessPiece.WhiteKing))
+		if (p == ChessPiece.WhiteKing)
 			whiteKing = move.to;
-		else if (p.equals(ChessPiece.BlackKing))
+		else if (p == ChessPiece.BlackKing)
 			blackKing = move.to;
+		else if (move.to.y == 0 && movedPiece == ChessPiece.WhitePawn) {
+			set(move.to, ChessPiece.WhiteQueen);
+		}
+		else if (move.to.y == 7 && movedPiece == ChessPiece.BlackPawn) {
+			set(move.to, ChessPiece.BlackQueen);
+		}
 		return piece;
 	}
 	//---------------------------------------------------
 	// undo a move using the saved piece from the original move
 	public void undoMove(ChessMove move, ChessPiece savedPiece) {
-		set(move.from, get(move.to));
+		set(move.from, movedPiece);
 		set(move.to, savedPiece);
 		ChessPiece p = get(move.from);
-		if (p.equals(ChessPiece.WhiteKing))
+		if (p == ChessPiece.WhiteKing)
 			whiteKing = move.from;
-		else if (p.equals(ChessPiece.BlackKing))
+		else if (p == ChessPiece.BlackKing)
 			blackKing = move.from;		
 	}
 	//---------------------------------------------------
@@ -149,6 +147,12 @@ public class ChessBoard {
 	//---------------------------------------------------
 	// initialize the board to the new game configuration
 	private void newGame() {
+		
+		for (int y = 0; y < 8; y++)
+			for (int x = 0; x < 8; x++)
+				board[x][y] = ChessPiece.Empty;		
+
+		
 		board[0][0] = ChessPiece.BlackRook;
 		board[1][0] = ChessPiece.BlackKnight;
 		board[2][0] = ChessPiece.BlackBishop;
@@ -184,13 +188,10 @@ public class ChessBoard {
 		board[5][6] = ChessPiece.WhitePawn;
 		board[6][6] = ChessPiece.WhitePawn;
 		board[7][6] = ChessPiece.WhitePawn;
-		
-		for (int y = 2; y <= 5; y++)
-			for (int x = 0; x < 8; x++)
-				board[x][y] = ChessPiece.Empty;		
-		
+				
 		whiteKing = new ChessLocation(4,7);
 		blackKing = new ChessLocation(4,0);
+
 	}
 	//---------------------------------------------------
 	// Generate a list of valid moves for the given color on this board
@@ -255,7 +256,7 @@ public class ChessBoard {
         // see if king can be killed by opponent king
         if (! inCheck)
         {
-            ChessPiece oppKing = (color == ChessColor.White) ? ChessPiece.BlackKing : ChessPiece.WhiteKing;
+            ChessPiece oppKing = (playerColor == ChessColor.White) ? ChessPiece.BlackKing : ChessPiece.WhiteKing;
             for (Dir d : kingPositions)
             {
                 int x = kingLoc.x + d.dx;
@@ -389,12 +390,12 @@ public class ChessBoard {
         }
 	}
 	//---------------------------------------------------
-	// Generate a list of valid moves for a pawn
+	// Generate a list of valid moves for a rook
 	void validRookMoves(ChessLocation loc, ArrayList<ChessMove> moves) {
         validMovesForContinuousPiece(loc, moves, rookDirections);
 	}
 	//---------------------------------------------------
-	// Generate a list of valid moves for a pawn
+	// Generate a list of valid moves for a knight
 	void validKnightMoves(ChessLocation loc, ArrayList<ChessMove> moves) {
 		ChessColor playerColor = board[loc.x][loc.y].color();
         for (Dir d : knightPositions) {
@@ -411,17 +412,17 @@ public class ChessBoard {
         }
 	}
 	//---------------------------------------------------
-	// Generate a list of valid moves for a pawn
+	// Generate a list of valid moves for a bishop
 	void validBishopMoves(ChessLocation loc, ArrayList<ChessMove> moves) {
         validMovesForContinuousPiece(loc, moves, bishopDirections);
 	}
 	//---------------------------------------------------
-	// Generate a list of valid moves for a pawn
+	// Generate a list of valid moves for a queen
 	void validQueenMoves(ChessLocation loc, ArrayList<ChessMove> moves) {
         validMovesForContinuousPiece(loc, moves, queenDirections);		
 	}
 	//---------------------------------------------------
-	// Generate a list of valid moves for a pawn
+	// Generate a list of valid moves for a king
 	void validKingMoves(ChessLocation loc, ArrayList<ChessMove> moves) {
 		ChessColor playerColor = board[loc.x][loc.y].color();
         for (Dir d : kingPositions) {
